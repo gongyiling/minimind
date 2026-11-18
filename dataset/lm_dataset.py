@@ -1,5 +1,6 @@
 from torch.utils.data import Dataset
 import torch
+import numpy as np
 import json
 import os
 import random
@@ -55,6 +56,36 @@ class PretrainDataset(Dataset):
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         labels = input_ids.clone()
         labels[input_ids == self.tokenizer.pad_token_id] = -100
+        return input_ids, labels
+
+
+class PretokenizedDataset(Dataset):
+    """读取预 tokenize 的 uint16 npy 文件，跳过训练时的实时分词。"""
+    def __init__(self, npy_path, max_length=512):
+        super().__init__()
+        meta_path = os.path.splitext(npy_path)[0] + ".meta.json"
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+            if meta.get('max_seq_len') != max_length:
+                raise ValueError(f'预tokenize数据的max_seq_len={meta.get("max_seq_len")} 与训练参数 {max_length} 不一致，请重新预处理')
+            self.bos_id = meta['bos_token_id']
+            self.eos_id = meta['eos_token_id']
+            self.pad_id = meta['pad_token_id']
+        else:
+            # 没有元数据时按默认 tokenizer 约定（MiniMind: bos=1, eos=2, pad=0）
+            self.bos_id, self.eos_id, self.pad_id = 1, 2, 0
+        self.input_ids = np.load(npy_path, mmap_mode='r')
+        self.max_length = max_length
+        print(f'[PretokenizedDataset] 已加载 {len(self.input_ids):,} 条预tokenize数据, shape={self.input_ids.shape}, dtype={self.input_ids.dtype}')
+
+    def __len__(self):
+        return len(self.input_ids)
+
+    def __getitem__(self, index):
+        input_ids = torch.from_numpy(self.input_ids[index].astype(np.int64))
+        labels = input_ids.clone()
+        labels[input_ids == self.pad_id] = -100
         return input_ids, labels
 
 

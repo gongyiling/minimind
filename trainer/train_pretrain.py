@@ -15,7 +15,7 @@ from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
-from dataset.lm_dataset import PretrainDataset
+from dataset.lm_dataset import PretrainDataset, PretokenizedDataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
 warnings.filterwarnings('ignore')
@@ -24,11 +24,11 @@ warnings.filterwarnings('ignore')
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
     iter_end_time = start_time  # 上一步训练结束时间，用于统计数据加载耗时
-    data_time_sum, data_time_count = 0.0, 0
+    data_time_sum = 0.0  # 距上次日志的累计数据加载等待时间
+    last_log_time, last_log_step = start_time, start_step  # 上次日志的时间与 step（滑动窗口）
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         data_time = time.time() - iter_end_time  # 等待并加载本批次数据的时间
         data_time_sum += data_time
-        data_time_count += 1
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
@@ -52,14 +52,14 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             optimizer.zero_grad(set_to_none=True)
 
         if step == start_step + 1 or step % args.log_interval == 0 or step == iters:
-            spend_time = time.time() - start_time
-            steps_done = max(step - start_step, 1)
+            now = time.time()
+            steps_delta = max(step - last_log_step, 1)
             current_loss = loss.item() * args.accumulation_steps
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]['lr']
-            step_time = spend_time / steps_done
-            avg_data_time = data_time_sum / max(data_time_count, 1)
+            step_time = (now - last_log_time) / steps_delta  # 最近窗口的平均单步耗时
+            avg_data_time = data_time_sum / steps_delta  # 最近窗口的平均数据加载等待
             eta_min = step_time * (iters - step) // 60
             log_msg = (f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), '
                        f'loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, '
@@ -70,6 +70,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                             f'{torch.cuda.max_memory_allocated(args.device) / 1024 ** 3:.2f}GB')
             Logger(log_msg)
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
+            last_log_time, last_log_step, data_time_sum = now, step, 0.0
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
@@ -108,6 +109,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--seed', default=42, type=int, help="随机种子（DDP下每个rank为seed+rank，每轮为seed+epoch）")
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_t2t_mini.jsonl", help="预训练数据路径")
+    parser.add_argument('--pretokenized_path', type=str, default='', help="预tokenize的npy路径（设置后跳过实时分词，优先于--data_path）")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
@@ -119,7 +121,8 @@ if __name__ == "__main__":
     local_rank = init_distributed_mode()
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
     setup_seed(args.seed + (dist.get_rank() if dist.is_initialized() else 0))
-    Logger(f'[1/8] 环境与随机种子就绪: device={args.device}, 分布式={dist.is_initialized()}, rank={dist.get_rank() if dist.is_initialized() else 0}')
+    gpu_name = torch.cuda.get_device_name(args.device) if torch.cuda.is_available() and 'cuda' in args.device else 'N/A'
+    Logger(f'[1/8] 环境与随机种子就绪: device={args.device} ({gpu_name}), 分布式={dist.is_initialized()}, rank={dist.get_rank() if dist.is_initialized() else 0}')
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     Logger('[2/8] 配置模型参数与检查断点...')
@@ -149,9 +152,13 @@ if __name__ == "__main__":
     # ========== 5. 定义模型、数据、优化器 ==========
     Logger('[5/8] 正在初始化模型...')
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
-    Logger(f'[5/8] 模型就绪, 正在加载数据集: {args.data_path}')
+    data_source = args.pretokenized_path if args.pretokenized_path else args.data_path
+    Logger(f'[5/8] 模型就绪, 正在加载数据集: {data_source}')
     data_start = time.time()
-    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    if args.pretokenized_path:
+        train_ds = PretokenizedDataset(args.pretokenized_path, max_length=args.max_seq_len)
+    else:
+        train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     Logger(f'[5/8] 数据集加载完成: {len(train_ds)} 条样本, 耗时 {time.time() - data_start:.1f}s')
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
