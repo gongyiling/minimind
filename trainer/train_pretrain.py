@@ -23,7 +23,12 @@ warnings.filterwarnings('ignore')
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
+    iter_end_time = start_time  # 上一步训练结束时间，用于统计数据加载耗时
+    data_time_sum, data_time_count = 0.0, 0
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
+        data_time = time.time() - iter_end_time  # 等待并加载本批次数据的时间
+        data_time_sum += data_time
+        data_time_count += 1
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
@@ -46,14 +51,24 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
             optimizer.zero_grad(set_to_none=True)
 
-        if step % args.log_interval == 0 or step == iters:
+        if step == start_step + 1 or step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
+            steps_done = max(step - start_step, 1)
             current_loss = loss.item() * args.accumulation_steps
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]['lr']
-            eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
-            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
+            step_time = spend_time / steps_done
+            avg_data_time = data_time_sum / max(data_time_count, 1)
+            eta_min = step_time * (iters - step) // 60
+            log_msg = (f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), '
+                       f'loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, '
+                       f'lr: {current_lr:.8f}, step_time: {step_time:.3f}s, data_time: {avg_data_time:.3f}s, '
+                       f'epoch_time: {eta_min:.1f}min')
+            if args.log_memory and 'cuda' in args.device:
+                log_msg += (f', mem: {torch.cuda.memory_allocated(args.device) / 1024 ** 3:.2f}GB/'
+                            f'{torch.cuda.max_memory_allocated(args.device) / 1024 ** 3:.2f}GB')
+            Logger(log_msg)
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
@@ -68,6 +83,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             model.train()
             del state_dict
 
+        iter_end_time = time.time()
         del input_ids, labels, res, loss
 
 
@@ -83,7 +99,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=8, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
-    parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
+    parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔（step）")
+    parser.add_argument("--log_memory", type=int, default=1, choices=[0, 1], help="日志中是否打印GPU显存占用（0=否，1=是）")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
@@ -102,16 +119,22 @@ if __name__ == "__main__":
     local_rank = init_distributed_mode()
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
     setup_seed(args.seed + (dist.get_rank() if dist.is_initialized() else 0))
+    Logger(f'[1/8] 环境与随机种子就绪: device={args.device}, 分布式={dist.is_initialized()}, rank={dist.get_rank() if dist.is_initialized() else 0}')
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
+    Logger('[2/8] 配置模型参数与检查断点...')
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
+    Logger(f'[2/8] 参数配置完成: hidden_size={args.hidden_size}, layers={args.num_hidden_layers}, use_moe={bool(args.use_moe)}' + (f', 检测到断点(epoch={ckp_data["epoch"]}, step={ckp_data.get("step", 0)})' if ckp_data else ', 无断点'))
     
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
+    Logger(f'[3/8] 设备与精度: device={args.device} (type={device_type}), dtype={args.dtype}, autocast={"off" if device_type == "cpu" else "on"}')
+    if device_type == "cpu":
+        Logger('[3/8] 警告: 当前以 CPU 训练。若机器有 NVIDIA 显卡却出现此提示，说明安装的 PyTorch 不带 CUDA 支持（torch.cuda.is_available()=False），请安装 CUDA 版 torch')
     
     # ========== 4. 配wandb ==========
     wandb = None
@@ -121,10 +144,15 @@ if __name__ == "__main__":
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
+        Logger(f'[4/8] SwanLab 已就绪: project={args.wandb_project}, run={wandb_run_name}')
     
     # ========== 5. 定义模型、数据、优化器 ==========
+    Logger('[5/8] 正在初始化模型...')
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    Logger(f'[5/8] 模型就绪, 正在加载数据集: {args.data_path}')
+    data_start = time.time()
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    Logger(f'[5/8] 数据集加载完成: {len(train_ds)} 条样本, 耗时 {time.time() - data_start:.1f}s')
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
@@ -137,27 +165,35 @@ if __name__ == "__main__":
         scaler.load_state_dict(ckp_data['scaler'])
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
+        Logger(f'[6/8] 断点恢复完成: 从 epoch={start_epoch + 1}, step={start_step} 继续')
     
     # ========== 7. 编译和分布式包装 ==========
     if args.use_compile == 1:
         model = torch.compile(model)
-        Logger('torch.compile enabled')
+        Logger('[7/8] torch.compile 已开启')
     if dist.is_initialized():
         model = DistributedDataParallel(model, device_ids=[local_rank])
+        Logger(f'[7/8] 分布式训练已启用: world_size={dist.get_world_size()}')
     
     # ========== 8. 开始训练 ==========
+    Logger(f'[8/8] 训练配置: epochs={args.epochs}, batch_size={args.batch_size}, accumulation_steps={args.accumulation_steps}, '
+           f'lr={args.learning_rate}, log_interval={args.log_interval}, save_interval={args.save_interval}, '
+           f'device={args.device}, dtype={args.dtype}, data_path={args.data_path}')
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         setup_seed(args.seed + epoch); indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+        Logger(f'===== Epoch [{epoch + 1}/{args.epochs}] 开始, 数据集大小={len(train_ds)}, 本轮step={len(loader) + skip} =====')
         if skip > 0: 
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
             train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
         else:
             train_epoch(epoch, loader, len(loader), 0, wandb)
-    
+        Logger(f'===== Epoch [{epoch + 1}/{args.epochs}] 结束 =====')
+
+    Logger(f'训练完成，共 {args.epochs} 个epoch')
     # ========== 9. 清理分布进程 ==========
     if dist.is_initialized():
         dist.barrier()
