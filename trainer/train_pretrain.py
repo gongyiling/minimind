@@ -109,13 +109,18 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--seed', default=42, type=int, help="随机种子（DDP下每个rank为seed+rank，每轮为seed+epoch）")
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_t2t_mini.jsonl", help="预训练数据路径")
-    parser.add_argument('--pretokenized_path', type=str, default='', help="预tokenize的npy路径（设置后跳过实时分词，优先于--data_path）")
+    parser.add_argument('--pretokenized_path', type=str, default='../dataset/pretrain_t2t_mini_tokenized.npy', help="预tokenize的npy路径（设置后跳过实时分词，优先于--data_path）")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
-    parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--use_compile", default=1, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     args = parser.parse_args()
+
+    # 预 tokenize 数据是 mmap 读取，无需 worker；Windows 下多 worker 会因 spawn 复制内存导致占用暴涨
+    if args.pretokenized_path and args.num_workers != 0:
+        Logger(f'[配置] 检测到预tokenize数据，num_workers 从 {args.num_workers} 强制设为 0（避免内存暴涨）')
+        args.num_workers = 0
 
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
@@ -181,7 +186,23 @@ if __name__ == "__main__":
     if dist.is_initialized():
         model = DistributedDataParallel(model, device_ids=[local_rank])
         Logger(f'[7/8] 分布式训练已启用: world_size={dist.get_world_size()}')
-    
+
+    # 预热编译：用 dummy batch 提前触发 torch.compile，避免编译开销混入第一个真实 step
+    if args.use_compile == 1:
+        Logger('[7/8] 预热编译中（dummy batch 跑一次完整前反向），首次约几分钟...')
+        compile_start = time.time()
+        dummy_ids = torch.randint(0, lm_config.vocab_size, (args.batch_size, args.max_seq_len), device=args.device)
+        model.train()
+        with autocast_ctx:
+            warmup_res = model(dummy_ids, labels=dummy_ids)
+            warmup_loss = warmup_res.loss + warmup_res.aux_loss
+        scaler.scale(warmup_loss).backward()
+        optimizer.zero_grad(set_to_none=True)  # 只触发编译，不更新参数，避免污染训练状态
+        if 'cuda' in args.device:
+            torch.cuda.synchronize()
+        del dummy_ids, warmup_res, warmup_loss
+        Logger(f'[7/8] 预热编译完成, 耗时 {time.time() - compile_start:.1f}s')
+
     # ========== 8. 开始训练 ==========
     Logger(f'[8/8] 训练配置: epochs={args.epochs}, batch_size={args.batch_size}, accumulation_steps={args.accumulation_steps}, '
            f'lr={args.learning_rate}, log_interval={args.log_interval}, save_interval={args.save_interval}, '
